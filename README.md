@@ -499,7 +499,7 @@ flowchart TD
 
     subgraph GPU_TOOLS["🖥️ GPU TOOLS — Sequential Loading"]
         CLIP["🧩 run_clip_adapter()\nInput: face tensor 224×224\nOutput: fake_score 0-1\nVRAM: 600MB | Time: ~1.5s"]
-        SBI["🔀 run_sbi()\nInput: face crop 224×224\nOutput: boundary_detected, score\nVRAM: 400MB | Time: ~0.8s"]
+        SBI["🔀 run_sbi()\nInput: face crop 380×380\nOutput: boundary_detected, score\nVRAM: 400MB | Time: ~0.8s"]
         FREQ["〰️ run_freqnet()\nInput: image tensor 224×224\nOutput: freq_anomaly_score\nVRAM: 400MB | Time: ~0.5s"]
     end
 
@@ -529,7 +529,7 @@ flowchart TD
     FE --> RPPG
     FC --> DCT
     LM --> GEO
-    FC & FD --> ILLUM
+    FC & LM --> ILLUM
 
     NP --> CLIP
     FC --> SBI
@@ -577,21 +577,27 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │ UPDATE    │ → Liveness: NOT DETECTED, signal_variance: 0.003, confidence: 0.1 │
 │         │           │ → Agent confidence: 0.35 (leaning FAKE)      │
 │                                                                     │
-│  Step 4 │ REASON    │ "Low biological signal. This face has no     │
-│         │           │  detectable pulse. Could be a still image    │
-│         │           │  or a generated face. Running CLIP."         │
+│  Step 4 │ REASON    │ "Low biological signal. Running remaining    │
+│         │           │  CPU tools to gather more evidence."         │
+│         │ ACT       │ run_dct() → double_quant: 0.82               │
+│         │           │ run_geometry() → geometry_score: 0.85        │
+│         │           │ run_illumination() → lighting_consistent: True│
+│         │ UPDATE    │ → Agent confidence: 0.45 (still leaning FAKE)│
+│                                                                     │
+│  Step 5 │ REASON    │ "CPU phase complete. Confidence < 0.85 so    │
+│         │           │  I must proceed to GPU phase. Loading CLIP." │
 │         │ ACT       │ run_clip_adapter() → High anomaly in hairline│
 │         │ UPDATE    │ → Anomaly score: 0.87, hotspot: hair region  │
 │         │           │ → Agent confidence: 0.82 (likely FAKE)       │
 │                                                                     │
-│  Step 5 │ REASON    │ "CLIP anomaly in hairline is consistent      │
+│  Step 6 │ REASON    │ "CLIP anomaly in hairline is consistent      │
 │         │           │  with diffusion model artifacts. One more    │
 │         │           │  check for high confidence."                 │
 │         │ ACT       │ run_freqnet() → GAN fingerprint detected     │
 │         │ UPDATE    │ → Artifact score: 0.91                       │
 │         │           │ → Agent confidence: 0.92 → EARLY STOP        │
 │                                                                     │
-│  Step 6 │ SYNTHESIZE│ Agent generates final verdict:               │
+│  Step 7 │ SYNTHESIZE│ Agent generates final verdict:               │
 │         │           │ ┌─────────────────────────────────────────┐  │
 │         │           │ │ Verdict:    FAKE                        │  │
 │         │           │ │ Confidence: 0.92                        │  │
@@ -602,11 +608,10 @@ Here is a concrete, narrated walkthrough showing how the agent processes a singl
 │         │           │ │  detection confirmed GAN fingerprints." │  │
 │         │           │ │ Tools used: [check_c2pa, run_rppg,     │  │
 │         │           │ │  run_clip_adapter, run_freqnet]         │  │
-│         │           │ │ Tools skipped: [run_dct,            │  │
-│         │           │ │  run_geometry, run_illumination]               │  │
+│         │           │ │ Tools skipped: [run_sbi]                     │  │
 │         │           │ └─────────────────────────────────────────┘  │
-│         │           │ → 4 tools skipped via early stopping         │
-│         │           │ → 50% compute saved vs fixed pipeline        │
+│         │           │ → 1 tool skipped via early stopping          │
+│         │           │ → compute saved vs fixed pipeline            │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -796,13 +801,13 @@ The 7 checks:
 
 | Check | Normal Range | What fake violation looks like |
 |:------|:------------|:-------------------------------|
-| IPD / face width ratio | 0.42 – 0.52 | Generators: often 0.35-0.38 or 0.55+ |
-| Eye width symmetry | > 0.80 | Generators: often 0.68-0.75 |
-| Facial thirds variance | < 0.15 | Generators: often 0.20-0.28 |
-| Head pose vs eye line | < 2° error | Generators: often 3-8° misalignment |
-| Nasolabial fold symmetry | > 0.82 | Generators: often 0.70-0.77 |
-| Temporal landmark jitter | < 0.8px std | Generators: often 1.5-3px (video only) |
-| Pupil-to-nostril ratio | 0.55 – 0.70 | Generators: often outside range |
+| IPD ratio (IPD / face width) | 0.42 – 0.52 | Generators: often 0.35-0.38 or 0.55+ |
+| Philtrum ratio | 0.10 – 0.15 | Generators: often <0.10 or >0.15 |
+| Eye width asymmetry | < 0.05 | Generators: often > 0.05 |
+| Jaw yaw symmetry (pose-gated) | < 0.08 | Generators: often > 0.08 |
+| Nose width ratio | 0.55 – 0.70 | Generators: often outside range |
+| Mouth width ratio | 0.85 – 1.05 | Generators: often outside range |
+| Vertical thirds | < 15% deviation | Generators: thirds deviate by > 15% |
 
 **Benchmark improvement from adding this tool:**
 
@@ -832,16 +837,13 @@ The generated face carries neutral or studio lighting; the scene
 has directional real-world lighting. This mismatch is detectable
 with undergraduate-level computer vision math.
 
-The 6 illumination checks:
+The 3 illumination checks:
 
 | Check | Normal Threshold | Fake Signature |
 |:------|:----------------|:---------------|
-| Face vs scene light direction | < 15° mismatch | Fakes: often 25-60° mismatch |
-| Specular highlight position | < 0.10 normalized error | Fakes: often 0.20-0.40 |
-| Nose shadow direction | < 10° from light source | Fakes: often 15-45° off |
-| Left-right face asymmetry | 0.03 – 0.15 ratio | Fakes: <0.02 (too symmetric) or wrong sign |
-| Color temperature face vs scene | < 200K difference | Fakes: often 300-800K |
-| Subsurface scattering pattern | Exponential falloff | Fakes: linear/uniform falloff |
+| Face boundary gradient | >= 0.05 | Fakes: diffuse, gradient < 0.05 (no clear direction) |
+| Lighting orientation | face_dom == ctx_dom | Fakes: mismatch between face and context dominance |
+| Left/Right asymmetry | face_grad penalty | Fakes: extreme penalties when context mismatches face |
 
 **Benchmark improvement from adding this tool:**
 
@@ -1011,7 +1013,7 @@ Respond in JSON:
 | `run_rppg()` | Detect biological liveness | POS algorithm + scipy | Video frames | `{liveness: bool, signal_variance, confidence}` | CPU |
 | `run_dct()` | Frequency spectrum analysis | scipy DCT | Image | `{grid_artifacts, double_quant, score}` | CPU |
 | `run_geometry()` | Facial anthropometric check | dlib landmarks + numpy | Landmark array | `{violations: list, score, checks_failed}` | CPU |
-| `run_illumination()` | Light source consistency | Shape-from-Shading + numpy | Face crop + frame | `{direction_mismatch_deg, color_temp_delta, score}` | CPU |
+| `run_illumination()` | Light source consistency | Shape-from-Shading + numpy | Face crop + landmarks | `{direction_mismatch_deg, color_temp_delta, score}` | CPU |
 | `run_clip_adapter()` | Universal forgery detection | CLIP ViT-B/32 + adapter | Face tensor | `{fake_score, feature_distances}` | GPU |
 | `run_sbi()` | Blend boundary detection | SBI EfficientNet-B4 | Face crop | `{boundary_detected, score, region}` | GPU |
 | `run_freqnet()` | Frequency-native detection | F3Net ResNet-50 | Image tensor | `{freq_anomaly_score, high_freq_score}` | GPU |
@@ -1459,7 +1461,7 @@ def analyze_dct_artifacts(image_gray):
     autocorr = np.correlate(coeff_histogram, coeff_histogram, mode='same')
     grid_score = detect_periodic_peaks(autocorr)
     
-    return {"grid_artifacts": grid_score > 0.7, "score": float(grid_score)}
+    return {"grid_artifacts": grid_score > 0.7, "score": float(grid_score), "double_quant": float(grid_score)}
 ```
 
 ### Physical Grounding & Hemodynamics
@@ -1474,7 +1476,7 @@ Every deepfake — whether GAN-generated, diffusion-based, or face-swapped — s
 - This check is independent of the generation method (works against GANs, diffusion, face swap)
 - Signal extraction works from standard webcam/smartphone footage
 
-**The CHROM Method:**
+**The POS Method:**
 
 Aegis-X uses the **POS (Plane Orthogonal to Skin-tone)** rPPG method, which projects the RGB signal onto a plane orthogonal to specular reflections:
 
@@ -1762,7 +1764,7 @@ Rules for generating this string:
 The tool must follow this exact lifecycle:
 
 ```python
-def run(frame, landmarks):
+def run(frame, landmarks, media_info, media_path, config):
     try:
         # 1. Load CLIP + all adapter components
         # 2. Move to device
@@ -1839,7 +1841,7 @@ SBI is the first tool that has a hard data dependency on two prior tool outputs.
 Every transformation from raw input to final output dict:
 
 ```text
-Native frame (H, W, 3) BGR  +  landmarks (68, 2) float
+Native frame (H, W, 3) BGR  +  landmarks (68, 2) float + media_info + media_path + config
         │
         ▼  BBOX COMPUTATION
 Compute face bounding box:
@@ -2018,7 +2020,7 @@ def sbi_ensemble_contribution(
     sbi_score:        float,
     clip_score:       float,
     dct_double_quant: float,
-) -> float:
+) -> tuple[float, float]:
 
     # Blind spot — no blend boundary signal at all
     if sbi_score < 0.30:
@@ -2038,7 +2040,7 @@ def sbi_ensemble_contribution(
     if dct_double_quant > 0.70:
         base *= 0.40
 
-    return base
+    return (base, eff_w if sbi_score >= 0.30 else 0.0)
 ```
 
 **SBI Design Decisions (Locked)**
@@ -2147,7 +2149,7 @@ for name, module in model.FAD_head.named_modules():
 **The Full Data Flow**
 
 ```text
-Native frame (H, W, 3) BGR  +  landmarks (68, 2) float
+Native frame (H, W, 3) BGR  +  landmarks (68, 2) float + media_info + media_path + config
         │
         ▼  FACE CROP EXTRACTION
 Compute face bbox:
@@ -2279,7 +2281,7 @@ Not triggered:
 def freqnet_ensemble_contribution(
     freq_score:       float,
     dct_double_quant: float,   # from DCT tool at pipeline position [3]
-) -> float:
+) -> tuple[float, float]:
 
     base = freq_score * 0.20
 
@@ -2290,7 +2292,7 @@ def freqnet_ensemble_contribution(
     if dct_double_quant > 0.70:
         base *= 0.50
 
-    return base
+    return (base, 0.20 if dct_double_quant <= 0.70 else 0.10)
 ```
 
 **FreqNet Design Decisions Summary**
