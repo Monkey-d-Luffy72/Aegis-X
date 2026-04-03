@@ -4,23 +4,41 @@ Generator-based execution with real-time UI feedback via AgentEvent yields.
 """
 
 from typing import Dict, List, Any, Generator
+import traceback
+import time
+
 from core.tools.registry import get_registry
 from core.early_stopping import EarlyStoppingController, StopReason
 from utils.ensemble import EnsembleAggregator
-from utils.thresholds import CONFIDENCE_GATE_THRESHOLD, EARLY_STOP_CONFIDENCE, ENSEMBLE_REAL_THRESHOLD, ENSEMBLE_FAKE_THRESHOLD
 from core.llm import generate_verdict
 from utils.logger import setup_logger
+from core.data_types import ToolResult
+import torch
+from utils.vram_manager import run_with_vram_cleanup
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 logger = setup_logger(__name__)
 
+GPU_VRAM_REQUIREMENTS = {
+    "run_freqnet": 0.4,
+    "run_univfd": 0.6,
+    "run_xception": 0.5,
+    "run_sbi": 0.8,
+}
+
+FACE_GATE_THRESHOLDS = {
+    "min_confidence": 0.60,
+    "min_face_area_ratio": 0.01,
+    "min_frames_with_faces": 0.30,
+    "min_face_pixel_area": 2500,
+}
 
 class AgentEvent:
     """Real-time progress event for UI streaming."""
     def __init__(self, event_type: str, tool_name: str = None, data: dict = None):
-        self.event_type = event_type  # "tool_start", "tool_complete", "verdict", etc.
+        self.event_type = event_type
         self.tool_name = tool_name
         self.data = data or {}
-
 
 class ForensicAgent:
     """Orchestrates forensic analysis with dynamic tool selection."""
@@ -31,188 +49,240 @@ class ForensicAgent:
         self.ensemble = EnsembleAggregator()
         self.esc = EarlyStoppingController(
             tool_registry=self.registry,
-            thresholds=(ENSEMBLE_REAL_THRESHOLD, ENSEMBLE_FAKE_THRESHOLD)
+            thresholds=(0.5, 0.5)  # Ensembles are handled independently here
         )
-    
-    def _run_cpu_phase(self, preprocess_result: Any, media_path: str = None) -> Generator[AgentEvent, Any, bool]:
-        """
-        Execute CPU tools with confidence gating.
         
-        Returns:
-            bool: True if confidence gate triggered (skip GPU), False otherwise
+    def _make_error_result(self, tool_name: str, error_msg: str, start_time: float) -> ToolResult:
+        return ToolResult(
+            tool_name=tool_name,
+            success=False,
+            score=0.5,
+            confidence=0.0,
+            details={"status": "ERROR", "error_msg": error_msg},
+            error=True,
+            error_msg=error_msg,
+            execution_time=time.time() - start_time,
+            evidence_summary=f"Tool failed: {error_msg}"
+        )
+        
+    def _safe_execute_tool(self, tool_name: str, input_data: dict, timeout: int = 30) -> ToolResult:
+        start_time = time.time()
+        try:
+            tool = self.registry.get_tool(tool_name)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(tool.execute, input_data)
+                result = future.result(timeout=timeout)
+            return result
+        except FuturesTimeoutError:
+            logger.error(f"Timeout executing {tool_name} after {timeout}s")
+            return self._make_error_result(tool_name, f"Timeout after {timeout}s", start_time)
+        except Exception as e:
+            logger.error(f"Error executing {tool_name}: {e}\n{traceback.format_exc()}")
+            return self._make_error_result(tool_name, str(e), start_time)
+
+    def analyze(self, preprocess_result: Any, media_path: str = None) -> Generator[AgentEvent, Any, dict]:
+        """
+        Main analysis loop — orchestrates CPU → GPU Gate → GPU Phase → Ensemble → LLM.
         """
         input_data = {
             "media_path": media_path,
             "tracked_faces": preprocess_result.tracked_faces,
             "frames_30fps": preprocess_result.frames_30fps,
-            "original_media_type": preprocess_result.original_media_type,
+            "original_media_type": getattr(preprocess_result, "original_media_type", "image"),
         }
         
-        cpu_tools = self.registry.get_cpu_tools()
+        flags = getattr(preprocess_result, "heuristic_flags", [])
         
-        for tool_name in cpu_tools:
-            # ── SKIP LOGIC ──
-            if tool_name == "run_rppg" and preprocess_result.original_media_type == "image":
-                logger.debug(f"Skipping {tool_name} (static image)")
-                continue
-            
-            if tool_name in ("run_geometry", "run_illumination", "run_corneal"):
-                if not preprocess_result.tracked_faces:
-                    logger.debug(f"Skipping {tool_name} (no landmarks)")
-                    continue
-            
-            # ── EXECUTE TOOL ──
-            yield AgentEvent("tool_start", tool_name)
-            
-            tool = self.registry.get_tool(tool_name)
-            result = tool.execute(input_data)
-            
-            self.ensemble.add_result(result)
-            
-            yield AgentEvent("tool_complete", tool_name, data={
-                "score": result.score,
-                "confidence": result.confidence,
-                "evidence_summary": result.evidence_summary,
-                "success": result.success,
-                "error_msg": result.error_msg
-            })
-            
-            # ── C2PA SHORT-CIRCUIT ──
-            if tool_name == "check_c2pa" and result.details.get("c2pa_verified"):
-                logger.info("C2PA verified — short-circuiting entire pipeline")
-                return True  # Skip everything, go straight to verdict
-            
-            # ── CONFIDENCE GATE (After CPU phase) ──
-            current_score = self.ensemble.get_final_score()
-            current_confidence = max(r.confidence for r in self.ensemble.tool_results.values()) if self.ensemble.tool_results else 0.0
-            
-            if current_confidence >= CONFIDENCE_GATE_THRESHOLD:
-                logger.info(f"Confidence gate triggered ({current_confidence:.2f} >= {CONFIDENCE_GATE_THRESHOLD})")
-                return True  # Skip GPU phase
+        # Determine Face Gate
+        face_detected = getattr(preprocess_result, "has_face", False)
+        pass_face_gate = face_detected
         
-        return False  # Continue to GPU phase
-    
-    def _run_gpu_phase(self, preprocess_result: Any) -> Generator[AgentEvent, Any, None]:
-        """Execute GPU tools with sequential VRAM cleanup."""
-        from utils.vram_manager import run_with_vram_cleanup
-        
-        input_data = {
-            "tracked_faces": preprocess_result.tracked_faces,
-            "frames_30fps": preprocess_result.frames_30fps,
-        }
-        
-        gpu_tools = self.registry.get_gpu_tools()
-        viable_pending = list(gpu_tools)
-        
-        for tool_name in gpu_tools:
-            if tool_name in viable_pending:
-                viable_pending.remove(tool_name)
+        # Example validation against thresholds if a face is detected
+        if face_detected:
+            if getattr(preprocess_result, "max_confidence", 0.0) < FACE_GATE_THRESHOLDS["min_confidence"]:
+                pass_face_gate = False
+            if getattr(preprocess_result, "max_face_area_ratio", 0.0) < FACE_GATE_THRESHOLDS["min_face_area_ratio"]:
+                pass_face_gate = False
+            if getattr(preprocess_result, "frames_with_faces_pct", 0.0) < FACE_GATE_THRESHOLDS["min_frames_with_faces"]:
+                pass_face_gate = False
+
+        yield AgentEvent("PIPELINE_SELECTED", data={"face_pipeline": pass_face_gate})
+
+        # ── SEGMENT A: CPU PHASE ──
+        cpu_tools_to_run = ["check_c2pa", "run_dct"]
+        if pass_face_gate:
+            if not getattr(preprocess_result, "insufficient_temporal_data", False) and input_data["original_media_type"] != "image":
+                cpu_tools_to_run.append("run_rppg")
+            
+            run_geo, run_illum, run_corn = True, True, True
+            if "MOTION_BLUR" in flags or "OCCLUSION" in flags:
+                run_geo, run_illum, run_corn = False, False, False
+            elif "FACE_TOO_SMALL" in flags:
+                run_corn = False
+            elif "LOW_LIGHT" in flags:
+                run_illum, run_corn = False, False
                 
-            # ── SKIP LOGIC ──
-            if tool_name == "run_sbi":
-                visual_result = self.ensemble.tool_results.get("run_univfd")
-                from utils.thresholds import SBI_SKIP_UNIVFD_THRESHOLD
-                if visual_result and visual_result.score > SBI_SKIP_UNIVFD_THRESHOLD:
-                    logger.debug(f"Skipping SBI (UnivFD score > {SBI_SKIP_UNIVFD_THRESHOLD} = fully synthetic)")
-                    continue
-            
-            # ── EXECUTE TOOL ──
-            yield AgentEvent("tool_start", tool_name)
-            
-            tool = self.registry.get_tool(tool_name)
-            
-            # VRAM-managed execution
-            def inference_fn(model):
-                return tool.execute(input_data)
-            
-            result = run_with_vram_cleanup(
-                lambda: tool,  # Tool is already loaded via registry
-                inference_fn,
-                model_name=tool_name,
-                required_vram_gb=0.6,
-            )
-            
+            if run_geo: cpu_tools_to_run.append("run_geometry")
+            if run_illum: cpu_tools_to_run.append("run_illumination")
+            if run_corn: cpu_tools_to_run.append("run_corneal")
+
+        for tool_name in cpu_tools_to_run:
+            yield AgentEvent("TOOL_STARTED", tool_name)
+            result = self._safe_execute_tool(tool_name, input_data, timeout=30)
             self.ensemble.add_result(result)
+            yield AgentEvent("TOOL_COMPLETED", tool_name, data={"success": result.success, "confidence": result.confidence})
             
-            yield AgentEvent("tool_complete", tool_name, data={
-                "score": result.score,
-                "confidence": result.confidence,
-                "evidence_summary": result.evidence_summary,
-                "success": result.success,
-                "error_msg": result.error_msg
-            })
-            
-            # ── EARLY STOP ESTIMATION ──
-            # Only include successfully executed tools
-            tool_scores = {
-                name: res.score for name, res in self.ensemble.tool_results.items()
-                if res.success
+            if tool_name == "check_c2pa" and result.success and result.details.get("c2pa_verified", False):
+                yield AgentEvent("EARLY_STOP", data={"reason": "C2PA_VERIFIED"})
+                # Short circuit!
+                return {
+                    "verdict": "REAL",
+                    "score": 1.0,  # 1.0 = Authentic in current terminology
+                    "explanation": "Cryptographically signed via C2PA provenance."
+                }
+
+        # ── SEGMENT B: CPU->GPU GATE ──
+        # Calculate CPU phase confidence
+        cpu_results = [r for name, r in self.ensemble.tool_results.items() if name in cpu_tools_to_run and r.success and not r.error and r.details.get("liveness_label") not in ("ABSTAIN", "ERROR")]
+        
+        decisive_results = [r for r in cpu_results if abs(r.score - 0.5) > 0.05]
+        
+        gate_decision = "FULL_GPU"
+        unison_agreement = False
+        agg_conf = 0.0
+        
+        if len(decisive_results) < 2:
+            gate_decision = "FULL_GPU"
+        else:
+            baseline_weights = {
+                "run_rppg": 0.35,
+                "run_geometry": 0.25,
+                "run_dct": 0.15,
+                "run_illumination": 0.10,
+                "run_corneal": 0.10,
+                "check_c2pa": 0.05
             }
+            active_weights = {r.tool_name: baseline_weights.get(r.tool_name, 0.0) for r in decisive_results}
+            total_active_weight = sum(active_weights.values())
             
-            # We also check for check_c2pa result from earlier
-            c2pa_verified = False
-            c2pa_res = self.ensemble.tool_results.get("check_c2pa")
-            if c2pa_res and c2pa_res.success and c2pa_res.details.get("c2pa_verified"):
-                c2pa_verified = True
+            if total_active_weight > 0:
+                normalized_weights = {k: v / total_active_weight for k, v in active_weights.items()}
+                directional_scores = []
+                for r in decisive_results:
+                    weight = normalized_weights[r.tool_name]
+                    direction = (r.score - 0.5) * 2
+                    directional_scores.append(direction * r.confidence * weight)
+                agg_direction = sum(directional_scores)
+                agg_conf = abs(agg_direction)
+            
+            # Check unison agreement
+            first_dir = decisive_results[0].score > 0.5
+            unison = all((r.score > 0.5) == first_dir for r in decisive_results)
+            
+            # Independent domains check
+            domains = set()
+            for r in decisive_results:
+                if r.tool_name == "run_rppg": domains.add("bio")
+                elif r.tool_name == "run_geometry": domains.add("phys")
+                elif r.tool_name == "run_dct": domains.add("freq")
+                elif r.tool_name == "check_c2pa": domains.add("auth")
+                # illumination & corneal are not counted independently for unison pass against geometry per spec
                 
-            decision = self.esc.evaluate(
-                tool_scores=tool_scores,
-                completed_tools=list(self.ensemble.tool_results.keys()),
-                c2pa_hardware_verified=c2pa_verified
-            )
-            
-            if decision.should_stop:
-                logger.info(f"Early stop triggered: {decision.reason.value} ({decision.confidence:.2f})")
-                yield AgentEvent("early_stop", data={"reason": decision.reason.value, "confidence": decision.confidence})
-                break
-    
-    def analyze(self, preprocess_result: Any, media_path: str = None) -> Generator[AgentEvent, Any, dict]:
-        """
-        Main analysis loop — orchestrates CPU → GPU → Ensemble → LLM.
-        
-        Yields:
-            AgentEvent: Real-time progress updates for UI
-        Returns:
-            dict: Final verdict with score, confidence, and explanation
-        """
-        skip_gpu = False
-        
-        # ── CPU PHASE ──
-        for event in self._run_cpu_phase(preprocess_result, media_path):
-            yield event
-            if event.event_type == "tool_complete" and event.tool_name == "check_c2pa":
-                if event.data.get("c2pa_verified"):
-                    skip_gpu = True
-                    break
-        
-        # ── GPU PHASE (Conditional) ──
-        if not skip_gpu:
-            for event in self._run_gpu_phase(preprocess_result):
-                yield event
-        
+            if unison and len(domains) >= 2:
+                unison_agreement = True
+                
+            if agg_conf > 0.93 and unison_agreement:
+                gate_decision = "HALT"
+            elif agg_conf >= 0.80:
+                gate_decision = "MINIMAL_GPU"
+            else:
+                gate_decision = "FULL_GPU"
+                
+        yield AgentEvent("GATE_DECISION", data={"decision": gate_decision, "confidence": agg_conf, "unison": unison_agreement})
+
+        # ── SEGMENT C: GPU PHASE ──
+        if gate_decision != "HALT":
+            gpu_sequence = []
+            if not pass_face_gate:
+                gpu_sequence = ["run_freqnet", "run_univfd", "run_xception"]
+            else:
+                gpu_sequence = ["run_freqnet", "run_univfd", "run_xception", "run_sbi"]
+                
+            if gate_decision == "MINIMAL_GPU":
+                gpu_sequence = ["run_univfd"]
+                
+            for tool_name in gpu_sequence:
+                yield AgentEvent("TOOL_STARTED", tool_name)
+                
+                # Manual sequential execution to emulate run_with_vram_cleanup
+                start_time = time.time()
+                try:
+                    tool = self.registry.get_tool(tool_name)
+                    
+                    req_vram = GPU_VRAM_REQUIREMENTS.get(tool_name, 0.6)
+                    
+                    def make_loader(t): 
+                        return lambda: t
+                    def make_inference(data):
+                        return lambda t: t.execute(data)
+                        
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(
+                            run_with_vram_cleanup, 
+                            make_loader(tool), 
+                            make_inference(input_data), 
+                            model_name=tool_name, 
+                            required_vram_gb=req_vram
+                        )
+                        result = future.result(timeout=60)
+                    self.ensemble.add_result(result)
+                    
+                    if hasattr(torch.cuda, "empty_cache"):
+                        torch.cuda.empty_cache()
+                        
+                    yield AgentEvent("TOOL_COMPLETED", tool_name, data={"success": result.success, "confidence": result.confidence})
+                except FuturesTimeoutError:
+                    logger.error(f"Timeout executing {tool_name} after 60s")
+                    self.ensemble.add_result(self._make_error_result(tool_name, "Timeout after 60s", start_time))
+                    if hasattr(torch.cuda, "empty_cache"):
+                        torch.cuda.empty_cache()
+                    yield AgentEvent("TOOL_COMPLETED", tool_name, data={"success": False, "error": True})
+                except Exception as e:
+                    logger.error(f"VRAM/Inference Error executing {tool_name}: {e}\n{traceback.format_exc()}")
+                    # Fallback counts as ABSTAIN/ERROR
+                    self.ensemble.add_result(self._make_error_result(tool_name, str(e), start_time))
+                    if hasattr(torch.cuda, "empty_cache"):
+                        torch.cuda.empty_cache()
+                    yield AgentEvent("TOOL_COMPLETED", tool_name, data={"success": False, "error": True})
+
+        # Check DEGRADED status if >50% of mapped tools errored out
+        is_degraded = False
+        total_errors = sum(1 for r in self.ensemble.tool_results.values() if r.error)
+        if len(self.ensemble.tool_results) > 0 and total_errors / len(self.ensemble.tool_results) > 0.5:
+            logger.warning("Agent Output flagged as DEGRADED due to excessive tool failures.")
+            is_degraded = True
+
         # ── ENSEMBLE SCORING ──
         final_score = self.ensemble.get_final_score()
-        verdict = self.ensemble.get_verdict()
+        verdict_str = self.ensemble.get_verdict()
         
-        # ── LLM SYNTHESIS ──
         yield AgentEvent("llm_start")
-        
         explanation = yield from generate_verdict(
             ensemble_score=final_score,
             tool_results=self.ensemble.tool_results,
-            verdict=verdict,
+            verdict=verdict_str,
         )
         
-        yield AgentEvent("verdict", data={
-            "verdict": verdict,
-            "score": final_score,
-            "confidence": max(r.confidence for r in self.ensemble.tool_results.values()),
+        yield AgentEvent("VERDICT", data={
+            "verdict": verdict_str, 
+            "score": final_score, 
             "explanation": explanation,
-            "tool_count": len(self.ensemble.tool_results),
+            "degraded": is_degraded
         })
         
         return {
-            "verdict": verdict,
+            "verdict": verdict_str,
             "score": final_score,
             "explanation": explanation,
+            "degraded": is_degraded,
         }

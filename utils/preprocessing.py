@@ -177,6 +177,8 @@ class TrackedFace:
     patch_nasolabial_right: Optional[np.ndarray] = None
     patch_hairline_band: Optional[np.ndarray] = None
     patch_chin_jaw: Optional[np.ndarray] = None
+    face_window: Tuple[int, int] = (0, 0)
+    heuristic_flags: List[str] = field(default_factory=list)
 
     def get(self, key, default=None):
         """Provide dict-like .get() compatibility for tools that expect dictionaries."""
@@ -205,6 +207,11 @@ class PreprocessResult:
     selected_frame_sharpness: float = 0.0
     original_media_type: str = "image"
     frame_count_warning: bool = False  # FIX 7: Flag for rPPG
+    max_confidence: float = 0.0
+    max_face_area_ratio: float = 0.0
+    frames_with_faces_pct: float = 0.0
+    heuristic_flags: List[str] = field(default_factory=list)
+    insufficient_temporal_data: bool = False
     
 class Preprocessor:
     """MediaPipe-based robust face landmark extraction and patching class."""
@@ -356,7 +363,7 @@ class Preprocessor:
             cx1, cy1 = max(0, x1), max(0, y1)
             cx2, cy2 = min(w, x2), min(h, y2)
             
-            face_crop = frame[cy1:cy2, cx1:x2]
+            face_crop = frame[cy1:cy2, cx1:cx2]
             if face_crop.size == 0:
                 continue
                 
@@ -424,12 +431,63 @@ class Preprocessor:
                             )
                         established_tracks[trk_id].trajectory_bboxes[i] = (int(x1), int(y1), int(x2), int(y2))
                 
-                # --- PHASE 2: EXTRACT CROPS PER-TRACK ---
+                # --- PHASE 2: EXTRACT CROPS PER-TRACK & HEURISTICS ---
+                gray_first = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
+                if gray_first.mean() < 50.0:
+                    result.heuristic_flags.append("LOW_LIGHT")
+                
                 for trk_id, track_obj in established_tracks.items():
                     # FIX 4: Less aggressive filtering for short videos
                     min_track_length = min(15, len(frames) // 2)
                     if len(track_obj.trajectory_bboxes) < min_track_length:
                         continue
+                        
+                    frames_present = sorted(list(track_obj.trajectory_bboxes.keys()))
+                    best_window = []
+                    current_window = [frames_present[0]]
+                    for idx in range(1, len(frames_present)):
+                        if frames_present[idx] == frames_present[idx-1] + 1:
+                            current_window.append(frames_present[idx])
+                        else:
+                            if len(current_window) > len(best_window):
+                                best_window = current_window
+                            current_window = [frames_present[idx]]
+                    if len(current_window) > len(best_window):
+                        best_window = current_window
+                        
+                    if len(best_window) > 0:
+                        track_obj.face_window = (best_window[0], best_window[-1] + 1)
+                    else:
+                        track_obj.face_window = (0, 0)
+                        
+                    if len(best_window) < len(frames_present) * 0.8:
+                        track_obj.heuristic_flags.append("OCCLUSION")
+
+                    avg_area_ratio = 0.0
+                    avg_sharpness = 0.0
+                    frame_w, frame_h = frames[0].shape[1], frames[0].shape[0]
+                    total_area = frame_w * frame_h
+                    sampled = 0
+                    
+                    for f_idx in best_window[::max(1, len(best_window)//10)]: # sample ~10 frames
+                        x1, y1, x2, y2 = track_obj.trajectory_bboxes[f_idx]
+                        area = ((x2 - max(0,x1)) * (y2 - max(0,y1))) / float(total_area)
+                        avg_area_ratio += area
+                        
+                        crop = frames[f_idx][max(0,y1):min(frame_h,y2), max(0,x1):min(frame_w,x2)]
+                        if crop.size > 0:
+                            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                            avg_sharpness += cv2.Laplacian(gray, cv2.CV_64F).var()
+                        sampled += 1
+                        
+                    if sampled > 0:
+                        avg_area_ratio /= sampled
+                        avg_sharpness /= sampled
+                        
+                    if avg_area_ratio < 0.01:
+                        track_obj.heuristic_flags.append("FACE_TOO_SMALL")
+                    if avg_sharpness < 15.0:
+                        track_obj.heuristic_flags.append("MOTION_BLUR")
                         
                     best_idx, best_sharpness = self._select_sharpest_frame(frames, track_obj.trajectory_bboxes)
                     target_image = frames[best_idx]
@@ -475,6 +533,43 @@ class Preprocessor:
                     result.has_face = True
                     result.selected_frame_index = result.tracked_faces[0].best_frame_idx
                     result.selected_frame_sharpness = best_sharpness
+                    
+                    # Calculate Gate Metrics
+                    frame_w, frame_h = frames[0].shape[1], frames[0].shape[0]
+                    total_area = frame_w * frame_h
+                    max_area_ratio = 0.0
+                    frames_with_face = set()
+                    
+                    for track in result.tracked_faces:
+                        for f_idx, box in track.trajectory_bboxes.items():
+                            frames_with_face.add(f_idx)
+                            x1, y1, x2, y2 = box
+                            area_ratio = ((x2 - x1) * (y2 - y1)) / total_area
+                            if area_ratio > max_area_ratio:
+                                max_area_ratio = area_ratio
+                                
+                    result.max_face_area_ratio = float(max_area_ratio)
+                    result.frames_with_faces_pct = len(frames_with_face) / len(frames) if len(frames) > 0 else 0.0
+                    
+                    max_conf = 0.0
+                    for track in result.tracked_faces:
+                        conf = len(track.trajectory_bboxes) / len(frames) if len(frames) > 0 else 0.0
+                        if conf > max_conf:
+                            max_conf = conf
+                    result.max_confidence = max_conf
+                    
+                    # Aggregate flags and check temporal insufficiency
+                    best_track = max(result.tracked_faces, key=lambda t: t.face_window[1] - t.face_window[0], default=None)
+                    if best_track:
+                        result.heuristic_flags.extend(best_track.heuristic_flags)
+                        result.heuristic_flags = list(set(result.heuristic_flags)) # dedup
+                        max_len = best_track.face_window[1] - best_track.face_window[0]
+                        if max_len < 90:
+                            result.insufficient_temporal_data = True
+                    else:
+                        result.insufficient_temporal_data = True
+                else:
+                    result.insufficient_temporal_data = True
                 
             elif is_image(path_str):
                 result.original_media_type = "image"
@@ -509,6 +604,13 @@ class Preprocessor:
                     track_obj.patch_chin_jaw = patches[5]
                     
                     result.tracked_faces.append(track_obj)
+                    
+                    h, w = image.shape[:2]
+                    area_ratio = ((x_max - x_min) * (y_max - y_min)) / (w * h)
+                    result.max_face_area_ratio = max(result.max_face_area_ratio, float(area_ratio))
+                
+                result.frames_with_faces_pct = 1.0
+                result.max_confidence = 1.0
             
             return result
             

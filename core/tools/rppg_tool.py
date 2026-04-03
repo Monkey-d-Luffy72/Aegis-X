@@ -15,6 +15,7 @@ from utils.thresholds import (
     RPPG_FFT_NFFT,
     RPPG_SNR_THRESHOLD
 )
+import mediapipe as mp
 
 
 class RPPGTool(BaseForensicTool):
@@ -226,13 +227,12 @@ class RPPGTool(BaseForensicTool):
 
         if analyzable_count < 2:
             return {
-                "label": "AMBIGUOUS",
-                "score": 0.0,  # FIX 1: Abstention = 0.0
-                "confidence": 0.0,
+                "label": "SYNTHETIC_FLATLINE",
+                "score": 1.0,  # FIX: Penalize flat pixel variance as FAKE
+                "confidence": 0.85,
                 "interpretation": (
-                    "rPPG abstained: Video quality too low for biological signal extraction. "
-                    f"Temporal color variance ({max(quality_stds):.2f}) is below the minimum "
-                    "threshold needed for pulse detection."
+                    "Biological liveness failed: Facial regions lack physiological temporal variance. "
+                    "This perfectly smooth consistency indicates AI generation lacking human blood flow."
                 ),
             }
 
@@ -254,33 +254,24 @@ class RPPGTool(BaseForensicTool):
 
         if n_good == 0:
             max_sc = max(m["spectral_concentration"] for m in metrics)
-            if max_sc < 1.5:
-                return {
-                    "label": "NO_PULSE",
-                    "score": 1.0,
-                    "confidence": 0.90,
-                    "interpretation": (
-                        "Biological liveness failed: No cardiac peak detected in any facial region. "
-                        f"Spectral concentration is flat (max {max_sc:.1f}x)."
-                    ),
-                }
-            else:
-                return {
-                    "label": "AMBIGUOUS",
-                    "score": 0.0,  # FIX 1: Abstention = 0.0
-                    "confidence": 0.0,
-                    "interpretation": (
-                        "rPPG inconclusive: Weak spectral peaks detected but none strong enough."
-                    ),
-                }
+            return {
+                "label": "NO_PULSE",
+                "score": 1.0,  # FIX: Always penalize 0 valid peaks as FAKE
+                "confidence": 0.90,
+                "interpretation": (
+                    "Biological liveness failed: No cardiac peak detected in any facial region. "
+                    f"Spectral concentration is flat (max {max_sc:.1f}x). Strong indicator of AI."
+                ),
+            }
 
         if n_good == 1:
             return {
-                "label": "AMBIGUOUS",
-                "score": 0.0,  # FIX 1: Abstention = 0.0
-                "confidence": 0.0,
+                "label": "WEAK_PULSE_FAILED",
+                "score": 1.0,  # FIX: Penalize partial failures as FAKE
+                "confidence": 0.70,
                 "interpretation": (
-                    "rPPG inconclusive: Only one facial region yielded a usable signal."
+                    "Biological liveness failed: Unnatural pulse signal. "
+                    "Only one facial region yielded a usable signal. Common in AI blending."
                 ),
             }
 
@@ -328,6 +319,34 @@ class RPPGTool(BaseForensicTool):
             ),
         }
 
+    def _lightweight_face_check(self, frames: list) -> bool:
+        """Sample up to 5 evenly-spaced frames, run MediaPipe face_detection to verify face presence."""
+        if not frames:
+            return False
+            
+        mp_face_detection = mp.solutions.face_detection
+        sample_indices = np.linspace(0, len(frames) - 1, min(5, len(frames)), dtype=int)
+        detections_count = 0
+        
+        # frames are assumed to be RGB based on Aegis-X preprocessing
+        with mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6) as face_detection:
+            for idx in sample_indices:
+                frame = frames[idx]
+                results = face_detection.process(frame)
+                
+                if results.detections:
+                    for detection in results.detections:
+                        bboxC = detection.location_data.relative_bounding_box
+                        h, w, _ = frame.shape
+                        area = (bboxC.width * w) * (bboxC.height * h)
+                        if detection.score[0] > 0.6 and area > 2500:
+                            detections_count += 1
+                            break # Found at least one valid face in this frame
+                            
+        # Face must be detected in majority of sampled frames
+        required_detections = min(3, len(sample_indices) // 2 + 1)
+        return detections_count >= required_detections
+
     def _run_inference(self, input_data: Dict[str, Any]) -> ToolResult:
         start_time = time.time()
 
@@ -359,47 +378,90 @@ class RPPGTool(BaseForensicTool):
                 evidence_summary="Missing required input data.",
             )
 
-        frames = input_data["frames_30fps"]
-        tracked_faces = input_data["tracked_faces"]
+        frames = input_data.get("frames_30fps", [])
+        tracked_faces = input_data.get("tracked_faces", [])
 
         if len(frames) < RPPG_MIN_FRAMES:
             return ToolResult(
                 tool_name=self.tool_name,
                 success=True,
-                score=0.0,  # FIX 1: Abstention = 0.0
+                score=0.0,
                 confidence=0.0,
-                details={"liveness_label": "ABSTAIN", "reason": "Insufficient frames"},
+                details={"liveness_label": "ABSTAIN", "reason": "INSUFFICIENT_TEMPORAL_DATA"},
                 error=False,
                 error_msg=None,
                 execution_time=time.time() - start_time,
-                evidence_summary="Neutral result: insufficient frames (< 90) for rPPG analysis.",
+                evidence_summary=f"rPPG skipped: insufficient frames ({len(frames)} < {RPPG_MIN_FRAMES}) for rPPG analysis.",
             )
+            
+        # BACKUP GUARD: Check if preprocessor missed faces or tracking is somehow empty.
+        # This prevents running purely on noise if invoked erroneously.
+        if not tracked_faces:
+            has_face = self._lightweight_face_check(frames)
+            if not has_face:
+                return ToolResult(
+                    tool_name=self.tool_name,
+                    success=True,
+                    score=0.0,
+                    confidence=0.0,
+                    details={"liveness_label": "ABSTAIN", "reason": "NO_FACE_CONFIRMED"},
+                    error=False,
+                    error_msg=None,
+                    execution_time=time.time() - start_time,
+                    evidence_summary="rPPG skipped: Neither preprocessor nor internal backup detector found a valid face."
+                )
 
         face_results = []
 
         for face in tracked_faces:
-            if "trajectory_bboxes" not in face or "landmarks" not in face:
+            trajectory = face.get("trajectory_bboxes", {})
+            landmarks = face.get("landmarks", [])
+            rois = self._get_facial_rois(landmarks)
+            
+            face_window = face.get("face_window", (0, 0))
+            if face_window[1] > face_window[0]:
+                start_offset = face_window[0]
+                end_frame = face_window[1]
+                target_frames = frames[start_offset:end_frame]
+                sliced_trajectory = {k - start_offset: v for k, v in trajectory.items() if start_offset <= k < end_frame}
+            else:
+                face_results.append({
+                    "score": 0.0,
+                    "confidence": 0.0,
+                    "label": "ABSTAIN",
+                    "interpretation": "Face window could not be established. Skipping to avoid noise.",
+                    "metrics": {}
+                })
                 continue
 
-            trajectory = face["trajectory_bboxes"]
-            landmarks = face["landmarks"]
-            rois = self._get_facial_rois(landmarks)
+            h_forehead, std_f, hair_f = self._extract_pos_signal(target_frames, sliced_trajectory, rois["forehead"])
+            h_left, std_l, hair_l = self._extract_pos_signal(target_frames, sliced_trajectory, rois["left_cheek"])
+            h_right, std_r, hair_r = self._extract_pos_signal(target_frames, sliced_trajectory, rois["right_cheek"])
 
-            h_forehead, std_f, hair_f = self._extract_pos_signal(frames, trajectory, rois["forehead"])
-            h_left, std_l, hair_l = self._extract_pos_signal(frames, trajectory, rois["left_cheek"])
-            h_right, std_r, hair_r = self._extract_pos_signal(frames, trajectory, rois["right_cheek"])
-
-            # If forehead is hair-occluded, abstain for this face
-            if hair_f or h_forehead is None or h_left is None or h_right is None:
-                face_results.append(
-                    {
-                        "score": 0.0,
-                        "confidence": 0.0,
-                        "label": "ABSTAIN",
-                        "interpretation": "One or more facial regions occluded or tracking failed.",
-                        "metrics": {}
-                    }
-                )
+            # If tracking was dropped entirely mid-video
+            if h_forehead is None or h_left is None or h_right is None:
+                if hair_f:
+                    # Legitimate hair occlusion -> Abstain
+                    face_results.append(
+                        {
+                            "score": 0.0,
+                            "confidence": 0.0,
+                            "label": "ABSTAIN",
+                            "interpretation": "One or more facial regions occluded by hair.",
+                            "metrics": {}
+                        }
+                    )
+                else:
+                    # Tracking just failed structurally -> FAKE
+                    face_results.append(
+                        {
+                            "score": 1.0,
+                            "confidence": 0.85,
+                            "label": "TRACKING_FAILED",
+                            "interpretation": "Facial tracking was structurally unstable and lost mid-video. Strong indicator of temporal AI instability.",
+                            "metrics": {}
+                        }
+                    )
                 continue
 
             liveness = self._evaluate_liveness(

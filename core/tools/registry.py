@@ -76,6 +76,8 @@ class ToolSpec:
 # In core/tools/registry.py, update _TOOL_MANIFEST:
 
 _TOOL_MANIFEST = [
+    ("check_c2pa",       "core.tools.c2pa_tool",         "C2PATool",         0.05, ToolCategory.PROVENANCE,  1),
+    ("run_dct",          "core.tools.dct_tool",          "DCTTool",          0.07, ToolCategory.FREQUENCY,   2),
     ("run_rppg",         "core.tools.rppg_tool",         "RPPGTool",         0.06, ToolCategory.BIOLOGICAL,  2),
     ("run_geometry",     "core.tools.geometry_tool",     "GeometryTool",     0.18, ToolCategory.GEOMETRIC,   3),
     ("run_illumination", "core.tools.illumination_tool", "IlluminationTool", 0.05, ToolCategory.FREQUENCY,   1),

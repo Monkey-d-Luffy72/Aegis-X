@@ -304,7 +304,9 @@ def calculate_ensemble_score(
     # ──────────────────────────────────────────────────────────────
     total_contribution, total_weight = 0.0, 0.0
     weight_breakdown = {} if return_metadata else None
-    tools_ran, abstentions, implied_probs = [], [], []
+    tools_ran, abstentions, implied_probs, gpu_specialist_probs = [], [], [], []
+    
+    GPU_SPECIALISTS = {"run_univfd", "run_xception", "run_sbi", "run_freqnet"}
     
     for result in tool_results:
         tool_name = _normalize_tool_name(result.tool_name)
@@ -320,7 +322,10 @@ def calculate_ensemble_score(
             abstentions.append({"tool_name": tool_name, "fake_score": result.fake_score, "reason": "blind_spot"})
         else:
             tools_ran.append(tool_name)
-            implied_probs.append(contribution / effective_weight)
+            implied = contribution / effective_weight
+            implied_probs.append(implied)
+            if tool_name in GPU_SPECIALISTS:
+                gpu_specialist_probs.append(implied)
         
         total_contribution += contribution
         total_weight += effective_weight
@@ -337,12 +342,13 @@ def calculate_ensemble_score(
     if total_weight < 1e-9:
         return {**_get_base_schema(), "ensemble_score": 0.5, "is_inconclusive": True, "abstentions": abstentions}
     
+    # Base weighted average combines both GPU specialists and CPU supporters
     base_ensemble = total_contribution / total_weight
     
     # Suspicion Overdrive (Feature-Isolation Logic)
-    # Specialized tools test orthogonal features (e.g. GAN vs face-swap).
-    # A clear authentic in one dimension does NOT cancel a deepfake in another.
-    max_prob = max(implied_probs) if implied_probs else 0.0
+    # Applied ONLY to true GPU specialists. CPU tools (Corneal, Geometry) act as 
+    # supporters and cannot single-handedly force a max-pool override.
+    max_prob = max(gpu_specialist_probs) if gpu_specialist_probs else 0.0
     
     # Debug logging to trace exactly what's happening
     logger.debug("Ensemble trace: implied_probs=%s, max_prob=%.4f, base_ensemble=%.4f", 

@@ -37,10 +37,10 @@ def build_phi3_prompt(
     prompt_parts.append(f"Overall Authenticity Score: {ensemble_score:.1%}")
     prompt_parts.append(f"Verdict: {verdict}\n")
     
-    # ── TOOL EVIDENCE (Each tool is a specialist) ──
-    prompt_parts.append("=== SPECIALIST TOOL EVIDENCE ===")
-    prompt_parts.append("Each tool below is an INDEPENDENT SPECIALIST that tests for a SPECIFIC type of manipulation.")
-    prompt_parts.append("If one specialist finds manipulation, other specialists finding nothing does NOT cancel it out.\n")
+    # ── TOOL EVIDENCE (Categorized) ──
+    prompt_parts.append("=== SECONDARY HELPERS (CPU heuristics) ===")
+    prompt_parts.append("These are classical physics/geometry heuristics that act as supporters.")
+    prompt_parts.append("They are noisy and should NEVER override a unanimous Authentic read from Primary AI Detectors.\n")
     
     # Helper to convert fake_score to real probability and interpret
     def _interpret(score: float, tool_desc: str, high_label: str, low_label: str) -> str:
@@ -66,7 +66,9 @@ def build_phi3_prompt(
     if "run_rppg" in tool_results:
         r = tool_results["run_rppg"]
         label = r.details.get("liveness_label", "UNKNOWN")
-        prompt_parts.append(f"💓 rPPG (Pulse Detection Specialist): {label} — {r.evidence_summary}")
+        prompt_parts.append(f"💓 rPPG (Pulse Detection Helper): {label} — {r.evidence_summary}")
+        if r.confidence == 0.0 or label == "UNKNOWN":
+            prompt_parts.append("  → CRITICAL INSTRUCTION: If rPPG failed to track a human pulse, this STRONGLY suggests the video is an AI generation (lacking real micro-blood flow) - unless the video is simply too short to measure. Explicitly mention this in your summary!")
     
     # DCT
     if "run_dct" in tool_results:
@@ -80,7 +82,7 @@ def build_phi3_prompt(
         r = tool_results["run_geometry"]
         violations = r.details.get("violations", [])
         real_prob = 1.0 - r.score
-        prompt_parts.append(_interpret(r.score, "📏 Geometry (Facial Proportion Specialist)", 
+        prompt_parts.append(_interpret(r.score, "📏 Geometry (Facial Proportion Helper)", 
                                        "all anatomical ratios normal",
                                        "impossible facial proportions detected"))
         if violations:
@@ -89,7 +91,7 @@ def build_phi3_prompt(
     # Illumination
     if "run_illumination" in tool_results:
         r = tool_results["run_illumination"]
-        prompt_parts.append(_interpret(r.score, "💡 Illumination (Lighting Consistency Specialist)",
+        prompt_parts.append(_interpret(r.score, "💡 Illumination (Lighting Consistency Helper)",
                                        "consistent lighting across face",
                                        "lighting inconsistencies detected"))
         if r.confidence == 0.0:
@@ -98,11 +100,15 @@ def build_phi3_prompt(
     # Corneal
     if "run_corneal" in tool_results:
         r = tool_results["run_corneal"]
-        prompt_parts.append(_interpret(r.score, "👁️ Corneal (Eye Reflection Specialist)",
+        prompt_parts.append(_interpret(r.score, "👁️ Corneal (Eye Reflection Helper)",
                                        "consistent corneal reflections",
                                        "mismatched eye reflections detected"))
         if r.confidence == 0.0:
             prompt_parts.append("  → ABSTAINED: insufficient reflection data")
+    
+    prompt_parts.append("\n=== PRIMARY AI DETECTORS (GPU SPECIALISTS) ===")
+    prompt_parts.append("These are deep-learning experts trained on millions of images. They are the true authorities.")
+    prompt_parts.append("If one of these Primary Specialists finds manipulation, it is a STRONG fake signal.\n")
     
     # UnivFD
     if "run_univfd" in tool_results:
@@ -140,9 +146,9 @@ def build_phi3_prompt(
     # ── REASONING RULES ──
     prompt_parts.append("\n=== REASONING RULES ===")
     prompt_parts.append("1. ALL scores above are AUTHENTICITY scores: high% = likely real, low% = likely fake.")
-    prompt_parts.append("2. Each tool is an INDEPENDENT specialist. If XceptionNet says 38% authenticity (face-swap detected), that is a STRONG fake signal even if FreqNet says 100% (no GAN artifacts) — they test different things!")
-    prompt_parts.append("3. Ground every claim in specific tool results.")
-    prompt_parts.append("4. Explain any conflicts between tools naturally.")
+    prompt_parts.append("2. Trust the PRIMARY AI DETECTORS heavily. If a Primary Detector spots manipulation, it's highly suspicious.")
+    prompt_parts.append("3. Treat SECONDARY HELPERS with skepticism on real images. They are noisy and cannot override Primary Detectors.")
+    prompt_parts.append("4. Ground every claim in specific tool results, explicitly using their names.")
     prompt_parts.append("5. Use probabilistic language ('suggests', 'consistent with') — avoid absolute certainty.")
     prompt_parts.append("6. Keep explanation under 150 words in plain language.")
     
