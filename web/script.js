@@ -135,6 +135,7 @@ document.addEventListener("DOMContentLoaded", () => {
             explanationBox.style.display = "none";
             explanationText.textContent = "";
             
+            const subjectGrids = {};
             const toolsGrid = document.getElementById("tools-grid");
             toolsGrid.innerHTML = '';
             
@@ -159,9 +160,29 @@ document.addEventListener("DOMContentLoaded", () => {
                         document.getElementById("faces-detected").textContent = payload.faces_detected;
                     } 
                     else if (payload.event_type === 'tool_complete') {
-                        // Create and append tool card dynamically
                         const res = payload.data;
                         const toolName = renderToolName(payload.tool_name);
+                        const subjId = res.subject_id;
+                        
+                        let targetGrid = toolsGrid;
+                        
+                        if (subjId) {
+                            if (!subjectGrids[subjId]) {
+                                // Create a new subject section
+                                const section = document.createElement('div');
+                                section.className = "subject-section";
+                                section.innerHTML = `
+                                    <div class="subject-header">
+                                        <div class="subject-badge">Forensic Subject</div>
+                                        <h3>${subjId.toUpperCase()}</h3>
+                                    </div>
+                                    <div class="subject-grid"></div>
+                                `;
+                                toolsGrid.appendChild(section);
+                                subjectGrids[subjId] = section.querySelector('.subject-grid');
+                            }
+                            targetGrid = subjectGrids[subjId];
+                        }
                         
                         let statusClass = "status-error";
                         let statusText = "ERROR";
@@ -219,7 +240,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                         
                         card.innerHTML = cardInner;
-                        toolsGrid.appendChild(card);
+                        targetGrid.appendChild(card);
                     }
                     else if (payload.event_type === 'llm_stream') {
                         // Stream explanation token-by-token (ChatGPT-style)
